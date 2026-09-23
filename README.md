@@ -138,7 +138,7 @@ Always build in release mode. Debug builds of Rust are 10–50× slower, and the
 timings would be meaningless.
 
 ```sh
-git clone <this repo>
+git clone https://github.com/FluffyByteSoftware/tick-sim/
 cd tick-sim
 cargo run --release
 ```

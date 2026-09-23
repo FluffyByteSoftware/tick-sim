@@ -88,10 +88,38 @@ Every tick, after the NPCs, the voxel world gets randomized upkeep:
 - **Edits.** `voxel_edits` random voxels anywhere in the world are dug out or
   filled in with dirt, standing in for players digging and building.
 
-A chunk that changes is marked dirty. Every `save_every_ms`, the tick copies
-each dirty chunk and hands the copies to a separate saver thread through a
-queue. The saver compresses them with run-length encoding, as a save file
-would, and discards the result. Nothing is written to disk.
+A chunk that changes is marked dirty. The tick copies dirty chunks and
+hands the copies to a separate saver thread through a queue, in one of two
+ways:
+
+- **All at once** (the default): every dirty chunk, every `save_every_ms`.
+- **A little every tick** (`save_per_tick=N`): up to N dirty chunks per tick,
+  carrying on from where the last tick stopped.
+
+The saver compresses each copy with run-length encoding, as a save file
+would. Without `disk_dir`, it then discards the result.
+
+### Saving to disk
+
+With `disk_dir` set, saves go to real files, using the same technique as the
+game server's disk writer (`src/disk.rs` is a cut-down copy of it):
+
+- Chunks are grouped into region files of `chunks_per_file` chunks. Files are
+  only ever replaced whole, so the saver keeps a compressed copy of every
+  chunk and rebuilds a region's whole file whenever any chunk in it changes.
+- Each file goes into a cache that keeps only the newest copy per file, and
+  the saver carries on straight away.
+- A background writer thread takes the whole cache at once. It writes each
+  file as `name.tmp` with `disk_threads` threads, forces each one onto the
+  disk, renames them over the real names, and then forces the folder onto
+  the disk once for the whole batch. A crash can never leave half a file.
+- When the cache is full (`disk_max_files` or `disk_max_mib`), the saver
+  waits for the writer. While it waits, chunk copies pile up in its queue.
+
+The files go in a `tick-sim-save` folder inside `disk_dir`, which is deleted
+at the end of the run unless `keep_files=1`. Which drive `disk_dir` is on
+matters a great deal: a spinning drive and an SSD will give very different
+results.
 
 Every chunk gets random ticks, as if the whole world were loaded at once. A
 real server would only do this near players, so treat `voxel_chunks` as the
@@ -138,7 +166,7 @@ Always build in release mode. Debug builds of Rust are 10–50× slower, and the
 timings would be meaningless.
 
 ```sh
-git clone <this repo>
+git clone https://github.com/FluffyByteSoftware/tick-sim.git
 cd tick-sim
 cargo run --release
 ```
@@ -171,7 +199,14 @@ cargo run --release -- objects=1000000 pin=3 load=16 seconds=30
 | `voxel_chunks` | 0    | Voxel chunks of 32×32×32 voxels (64 KiB each); 0 = off     |
 | `random_ticks` | 24   | Random voxel checks per chunk per tick                     |
 | `voxel_edits` | 100   | Random voxels dug out or filled in per tick                |
-| `save_every_ms` | 5000 | How often dirty chunks are copied to the saver; 0 = never |
+| `save_every_ms` | 5000 | Copy *all* dirty chunks to the saver this often; 0 = never |
+| `save_per_tick` | 0   | Instead, copy up to this many dirty chunks every tick      |
+| `disk_dir` | none     | Write saves to real files in `disk_dir/tick-sim-save`      |
+| `chunks_per_file` | 64 | Chunks per region file                                    |
+| `disk_threads` | 8    | Threads the disk writer uses per batch                     |
+| `disk_max_files` | 100 | Disk cache limit, in files                                |
+| `disk_max_mib` | 2048 | Disk cache limit, in MiB                                   |
+| `keep_files` | 0      | `1` leaves the save files on disk after the run            |
 
 ### Sweep script
 
@@ -229,7 +264,29 @@ voxels     4096 chunks = 134.2M voxels (256 MiB) | random ticks 24/chunk | edits
 saver      compressed N chunks, N MiB -> N MiB, busy N ms in total
 ```
 
-The `saving` row only counts ticks on which a save happened. With `hash_every_ms` set, five more lines follow:
+The `saving` row only counts ticks on which a save happened. With
+`disk_dir` set, three more lines describe the disk:
+
+```
+disk       region files of 64 chunks | N files handed to the writer, N replaced a copy still waiting
+writer     N batches, N files written (0 failed), N MiB in N s busy (N MiB/s) | biggest batch N files | longest N ms
+cache full saver waited N times, N s in total | the writer's last batches took N s
+```
+
+With any saving on, the `saver` line is followed by one more:
+
+```
+saver      finished N s after the last tick (how far behind it was)
+```
+
+- **most waiting for saver** (on the `voxels` line) is the largest number of
+  chunk copies ever queued for the saver at once. If it keeps growing with
+  run length, the saving pipeline can't keep up.
+- **cache full** shows how often, and for how long, the disk writer's cache
+  was full.
+- **saver finished N s after the last tick** is how long the saver and disk
+  writer needed to finish everything still queued when the run ended: how
+  far behind saving had fallen. Near zero means it kept up. With `hash_every_ms` set, five more lines follow:
 
 ```
 hashing    every 2000 ms: 8 hash(es) on 4 thread(s), Argon2id 19456 KiB x 2 passes x 1 lane(s)

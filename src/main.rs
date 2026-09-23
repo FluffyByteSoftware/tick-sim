@@ -27,7 +27,14 @@
 //   voxel_chunks=C   voxel chunks of 32x32x32 (64 KiB each), 0=off  (default 0)
 //   random_ticks=R   random voxel checks per chunk per tick         (default 24)
 //   voxel_edits=E    random voxels dug or filled per tick           (default 100)
-//   save_every_ms=T  copy dirty chunks to the saver thread, 0=off   (default 5000)
+//   save_every_ms=T  copy ALL dirty chunks to the saver every T ms, 0=off (default 5000)
+//   save_per_tick=N  instead: copy up to N dirty chunks every tick   (default 0 = off)
+//   disk_dir=PATH    write saves to real files under PATH/tick-sim-save (default: no disk)
+//   chunks_per_file=K  chunks in one region file                     (default 64)
+//   disk_threads=W   threads the disk writer uses per batch           (default 8)
+//   disk_max_files=F disk cache limit, files                          (default 100)
+//   disk_max_mib=M   disk cache limit, MiB                            (default 2048)
+//   keep_files=1     leave the save files on disk after the run
 
 use std::hint::black_box;
 use std::io::ErrorKind;
@@ -39,6 +46,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
+
+// `mod disk;` pulls in src/disk.rs as a module of this program. `use` then
+// lets us write DiskWriter instead of disk::DiskWriter.
+mod disk;
+use disk::{DiskStats, DiskWriter, Limits};
+use std::path::PathBuf;
 
 /// Ticks ignored in the stats while caches and CPU clocks settle.
 const WARMUP_TICKS: usize = 20;
@@ -72,9 +85,19 @@ struct Config {
     random_ticks: usize,
     voxel_edits: usize,
     save_every_ms: u64,
+    save_per_tick: usize,
+    chunks_per_file: usize,
+    disk_threads: usize,
+    disk_max_files: usize,
+    disk_max_mib: u64,
+    keep_files: bool,
 }
 
-fn parse_args() -> Config {
+/// Reads the settings. The disk folder comes back separately because a path
+/// is text, and text can't live in Config: Config is Copy (copied freely
+/// between threads), and a String can't be copied that way.
+fn parse_args() -> (Config, Option<PathBuf>) {
+    let mut disk_dir: Option<PathBuf> = None;
     let mut cfg = Config {
         objects: 100_000, // underscores in numbers are just for readability
         npc_every: 10,
@@ -97,6 +120,12 @@ fn parse_args() -> Config {
         random_ticks: 24, // 3 per 16x16x16 section, a common block-game rate
         voxel_edits: 100,
         save_every_ms: 5000,
+        save_per_tick: 0,
+        chunks_per_file: 64,
+        disk_threads: 8,
+        disk_max_files: 100,
+        disk_max_mib: 2048,
+        keep_files: false,
     };
 
     // args() yields the program name first, so skip(1) drops it.
@@ -136,6 +165,13 @@ fn parse_args() -> Config {
             "random_ticks" => cfg.random_ticks = parse_num(key, value),
             "voxel_edits" => cfg.voxel_edits = parse_num(key, value),
             "save_every_ms" => cfg.save_every_ms = parse_num(key, value),
+            "save_per_tick" => cfg.save_per_tick = parse_num(key, value),
+            "disk_dir" => disk_dir = Some(PathBuf::from(value)),
+            "chunks_per_file" => cfg.chunks_per_file = parse_num(key, value),
+            "disk_threads" => cfg.disk_threads = parse_num(key, value),
+            "disk_max_files" => cfg.disk_max_files = parse_num(key, value),
+            "disk_max_mib" => cfg.disk_max_mib = parse_num(key, value),
+            "keep_files" => cfg.keep_files = value == "1" || value == "true",
             _ => eprintln!("ignoring unknown setting '{key}'"),
         }
     }
@@ -149,7 +185,9 @@ fn parse_args() -> Config {
         assert!(cfg.hash_threads >= 1, "hash_threads must be at least 1");
         assert!(cfg.hash_burst >= 1, "hash_burst must be at least 1");
     }
-    cfg
+    assert!(cfg.chunks_per_file >= 1, "chunks_per_file must be at least 1");
+    assert!(cfg.disk_threads >= 1, "disk_threads must be at least 1");
+    (cfg, disk_dir)
 }
 
 // Generic helper: T is whatever number type the destination field is
@@ -246,10 +284,13 @@ fn update_npcs(world: &mut [Object], npcs: &[usize], dt: f32) {
 //   - Edits: `voxel_edits` voxels anywhere in the world get dug out or
 //     filled in, standing in for players digging and building.
 //
-// A chunk that changes is marked dirty. Every `save_every_ms`, the tick
-// copies each dirty chunk and hands the copies to a saver thread, which
-// compresses them the way a save file would (and then throws the result
-// away: nothing is written to disk).
+// A chunk that changes is marked dirty. The tick copies dirty chunks and
+// hands the copies to a saver thread, either all of them every
+// `save_every_ms`, or up to `save_per_tick` of them on every tick. The saver
+// compresses each one. Without `disk_dir` it then throws the result away.
+// With `disk_dir`, it keeps a compressed copy of every chunk, and whenever a
+// chunk changes it rebuilds that chunk's whole region file and hands it to
+// the disk writer (src/disk.rs), which works the way the game server's does.
 //
 // Every chunk gets random ticks, as if the whole world were loaded. A real
 // server would only do this for chunks near players, so voxel_chunks here
@@ -335,7 +376,11 @@ fn build_chunk(rng: &mut Rng) -> Chunk {
 struct VoxelStats {
     changes: u64,      // voxels that actually changed (edits + rules)
     chunks_saved: u64, // dirty chunks copied to the saver
+    max_backlog: usize, // most chunk copies ever waiting for the saver at once
 }
+
+/// What the tick sends the saver: which chunk, and a copy of its blocks.
+type ChunkCopy = (usize, Vec<u16>);
 
 struct VoxelWorld {
     chunks: Vec<Chunk>,
@@ -344,12 +389,17 @@ struct VoxelWorld {
     edits: usize,
     // mpsc = "multiple producer, single consumer": a queue between threads.
     // The Sender end puts things in; the saver thread takes them out.
-    saver: Option<mpsc::Sender<Vec<u16>>>,
+    saver: Option<mpsc::Sender<ChunkCopy>>,
+    /// How many copies are sent but not yet picked up by the saver. The tick
+    /// adds one per send, the saver takes one off per receive.
+    backlog: Arc<AtomicUsize>,
+    /// Where save_some() carries on looking for dirty chunks next tick.
+    save_cursor: usize,
     stats: VoxelStats,
 }
 
 impl VoxelWorld {
-    fn new(cfg: &Config, saver: Option<mpsc::Sender<Vec<u16>>>) -> VoxelWorld {
+    fn new(cfg: &Config) -> VoxelWorld {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15); // any non-zero start works
         let chunks = (0..cfg.voxel_chunks).map(|_| build_chunk(&mut rng)).collect();
         VoxelWorld {
@@ -357,9 +407,17 @@ impl VoxelWorld {
             rng,
             random_ticks: cfg.random_ticks,
             edits: cfg.voxel_edits,
-            saver,
+            saver: None,
+            backlog: Arc::new(AtomicUsize::new(0)),
+            save_cursor: 0,
             stats: VoxelStats::default(),
         }
+    }
+
+    /// Connects the world to a saver thread.
+    fn connect_saver(&mut self, saver: mpsc::Sender<ChunkCopy>, backlog: Arc<AtomicUsize>) {
+        self.saver = Some(saver);
+        self.backlog = backlog;
     }
 
     fn voxel_count(&self) -> usize {
@@ -418,20 +476,47 @@ impl VoxelWorld {
         }
     }
 
-    /// Copies every dirty chunk into the saver's queue and marks it clean.
+    /// Hands a copy of chunk `c` to the saver and marks it clean.
+    fn hand_over(&mut self, c: usize) {
+        if let Some(saver) = &self.saver {
+            // Count it before sending, so the saver can never take it off
+            // the count before it has been put on.
+            let waiting = self.backlog.fetch_add(1, Ordering::Relaxed) + 1;
+            // clone() copies all 64 KiB, so the saver works on a snapshot
+            // while the tick carries on changing the real chunk.
+            if saver.send((c, self.chunks[c].blocks.clone())).is_ok() {
+                self.stats.chunks_saved += 1;
+                self.stats.max_backlog = self.stats.max_backlog.max(waiting);
+            } else {
+                self.backlog.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.chunks[c].dirty = false;
+    }
+
+    /// Copies every dirty chunk to the saver, all in this one tick.
     fn save_dirty(&mut self) {
-        let saver = match &self.saver {
-            Some(saver) => saver,
-            None => return,
-        };
-        for chunk in self.chunks.iter_mut() {
-            if chunk.dirty {
-                // clone() copies all 64 KiB, so the saver works on a snapshot
-                // while the tick carries on changing the real chunk.
-                if saver.send(chunk.blocks.clone()).is_ok() {
-                    self.stats.chunks_saved += 1;
-                }
-                chunk.dirty = false;
+        for c in 0..self.chunks.len() {
+            if self.chunks[c].dirty {
+                self.hand_over(c);
+            }
+        }
+    }
+
+    /// Copies up to `max` dirty chunks to the saver, carrying on from where
+    /// the last tick stopped, so every chunk gets its turn.
+    fn save_some(&mut self, max: usize) {
+        let count = self.chunks.len();
+        let mut sent = 0;
+        for _ in 0..count {
+            if sent == max {
+                break;
+            }
+            let c = self.save_cursor;
+            self.save_cursor = (c + 1) % count;
+            if self.chunks[c].dirty {
+                self.hand_over(c);
+                sent += 1;
             }
         }
     }
@@ -442,28 +527,104 @@ struct SaverStats {
     chunks: u64,
     bytes_in: u64,
     bytes_out: u64,
-    busy: Duration,
+    busy: Duration,             // time spent compressing
+    files_handed: u64,          // region files handed to the disk writer
+    final_flush: Duration,      // time for the disk writer to empty its cache at the end
+    catch_up: Duration,         // time from the last tick until the saver was completely done
+    disk: Option<DiskStats>,    // what the disk writer did, if there was one
 }
 
-/// Starts the saver thread. It compresses each chunk copy it's sent, and
-/// stops by itself once the tick thread is done: when every Sender is gone,
-/// the `for` loop over the Receiver simply ends.
-fn start_saver() -> (mpsc::Sender<Vec<u16>>, thread::JoinHandle<SaverStats>) {
-    let (sender, receiver) = mpsc::channel::<Vec<u16>>();
+/// Starts the saver thread.
+///
+/// Without a disk folder, it compresses each chunk copy and throws it away.
+///
+/// With one, it keeps `mirror`: a compressed copy of every chunk in the
+/// world. When chunks change, it rebuilds each changed region file whole
+/// from the mirror and hands it to the disk writer. The server's disk writer
+/// only replaces whole files, so a region file always holds every chunk in
+/// it, changed or not.
+///
+/// It stops by itself once the tick thread is done: when every Sender is
+/// gone, recv() returns an error and the loop ends.
+fn start_saver(
+    cfg: Config,
+    disk_dir: Option<PathBuf>,
+    mut mirror: Vec<Vec<u8>>,
+    backlog: Arc<AtomicUsize>,
+) -> (mpsc::Sender<ChunkCopy>, thread::JoinHandle<SaverStats>) {
+    let (sender, receiver) = mpsc::channel::<ChunkCopy>();
     let handle = thread::spawn(move || {
         let mut stats = SaverStats::default();
-        for blocks in receiver {
+        let regions = cfg.voxel_chunks.div_ceil(cfg.chunks_per_file);
+        let mut region_dirty = vec![false; regions];
+        let disk = disk_dir.as_ref().map(|_| {
+            DiskWriter::start(Limits {
+                max_files: cfg.disk_max_files,
+                max_bytes: cfg.disk_max_mib * 1024 * 1024,
+                threads: cfg.disk_threads,
+            })
+        });
+
+        // Wait for one chunk copy, then take every other one already queued,
+        // then hand the changed region files to the disk writer. Repeat.
+        while let Ok(first) = receiver.recv() {
+            let mut next = Some(first);
+            while let Some((index, blocks)) = next {
+                backlog.fetch_sub(1, Ordering::Relaxed);
+                let t = Instant::now();
+                let packed = compress(&blocks);
+                stats.busy += t.elapsed();
+                stats.chunks += 1;
+                stats.bytes_in += (blocks.len() * 2) as u64;
+                stats.bytes_out += packed.len() as u64;
+                if disk.is_some() {
+                    mirror[index] = packed;
+                    region_dirty[index / cfg.chunks_per_file] = true;
+                } else {
+                    black_box(&packed);
+                }
+                // try_recv() doesn't wait: it's Err when the queue is empty.
+                next = receiver.try_recv().ok();
+            }
+
+            if let (Some(writer), Some(dir)) = (&disk, &disk_dir) {
+                for region in 0..regions {
+                    if region_dirty[region] {
+                        region_dirty[region] = false;
+                        let contents = region_file(&mirror, region, cfg.chunks_per_file);
+                        stats.files_handed += 1;
+                        // This waits if the disk writer's cache is full, and
+                        // while it waits, chunk copies pile up in the queue.
+                        writer.write_later(dir.join(format!("region-{region:05}.bin")), contents);
+                    }
+                }
+            }
+        }
+
+        // The tick thread is done. Write whatever is still waiting, and time
+        // how long that takes: it shows how far behind the disk was.
+        if let Some(writer) = disk {
             let t = Instant::now();
-            let packed = compress(&blocks);
-            stats.busy += t.elapsed();
-            stats.chunks += 1;
-            stats.bytes_in += (blocks.len() * 2) as u64;
-            stats.bytes_out += packed.len() as u64;
-            black_box(&packed);
+            stats.disk = Some(writer.stop());
+            stats.final_flush = t.elapsed();
         }
         stats
     });
     (sender, handle)
+}
+
+/// Builds one whole region file from the compressed chunks in it:
+/// [chunk count u32], then for each chunk [length u32][compressed bytes].
+fn region_file(mirror: &[Vec<u8>], region: usize, per_file: usize) -> Vec<u8> {
+    let first = region * per_file;
+    let last = (first + per_file).min(mirror.len());
+    let mut out = Vec::new();
+    out.extend_from_slice(&((last - first) as u32).to_le_bytes());
+    for chunk in &mirror[first..last] {
+        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out
 }
 
 /// Run-length encoding: each run of identical blocks becomes a pair of
@@ -875,7 +1036,14 @@ fn tick_loop(
             terrain.tick();
             voxel_time = t.elapsed();
 
-            if save_every_ticks > 0 && tick > 0 && tick % save_every_ticks == 0 {
+            if cfg.save_per_tick > 0 {
+                // A little every tick.
+                let t = Instant::now();
+                terrain.save_some(cfg.save_per_tick);
+                save_time = t.elapsed();
+                saved = true;
+            } else if save_every_ticks > 0 && tick > 0 && tick % save_every_ticks == 0 {
+                // Everything at once.
                 let t = Instant::now();
                 terrain.save_dirty();
                 save_time = t.elapsed();
@@ -1050,14 +1218,21 @@ fn report(
         let voxels = cfg.voxel_chunks * CHUNK_VOXELS;
         let mib = (cfg.voxel_chunks * CHUNK_VOXELS * 2) as f64 / (1024.0 * 1024.0);
         println!(
-            "voxels     {} chunks = {:.1}M voxels ({mib:.0} MiB) | random ticks {}/chunk | edits {}/tick | changes {:.1}/tick | chunks saved {}",
+            "voxels     {} chunks = {:.1}M voxels ({mib:.0} MiB) | random ticks {}/chunk | edits {}/tick | changes {:.1}/tick | chunks saved {} | most waiting for saver {}",
             cfg.voxel_chunks,
             voxels as f64 / 1e6,
             cfg.random_ticks,
             cfg.voxel_edits,
             v.changes as f64 / samples.len().max(1) as f64,
-            v.chunks_saved
+            v.chunks_saved,
+            v.max_backlog
         );
+        let how = if cfg.save_per_tick > 0 {
+            format!("up to {} chunks every tick", cfg.save_per_tick)
+        } else {
+            format!("all dirty chunks every {} ms", cfg.save_every_ms)
+        };
+        println!("saving     {how}");
     }
     if let Some(s) = saver_stats {
         println!(
@@ -1067,6 +1242,35 @@ fn report(
             s.bytes_out as f64 / (1024.0 * 1024.0),
             s.busy.as_secs_f64() * 1e3
         );
+        println!(
+            "saver      finished {:.1} s after the last tick (how far behind it was)",
+            s.catch_up.as_secs_f64()
+        );
+        if let Some(d) = s.disk {
+            let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+            let busy_s = d.busy.as_secs_f64();
+            println!(
+                "disk       region files of {} chunks | {} files handed to the writer, {} replaced a copy still waiting",
+                cfg.chunks_per_file, s.files_handed, d.replaced
+            );
+            println!(
+                "writer     {} batches, {} files written ({} failed), {:.1} MiB in {:.1} s busy ({:.1} MiB/s) | biggest batch {} files | longest {:.0} ms",
+                d.batches,
+                d.files_written,
+                d.files_failed,
+                mib(d.bytes_written),
+                busy_s,
+                if busy_s > 0.0 { mib(d.bytes_written) / busy_s } else { 0.0 },
+                d.biggest_batch,
+                d.longest_batch.as_secs_f64() * 1e3
+            );
+            println!(
+                "cache full saver waited {} times, {:.1} s in total | the writer's last batches took {:.1} s",
+                d.waits,
+                d.waited.as_secs_f64(),
+                s.final_flush.as_secs_f64()
+            );
+        }
     }
 
     if cfg.hash_every_ms > 0 {
@@ -1107,7 +1311,7 @@ fn report(
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let cfg = parse_args();
+    let (cfg, disk_dir) = parse_args();
 
     eprintln!("building world of {} objects...", cfg.objects);
     let mut world = build_world(cfg.objects);
@@ -1135,17 +1339,30 @@ fn main() {
     // Voxels: the world lives on the tick thread; saving gets its own thread.
     let mut voxels: Option<VoxelWorld> = None;
     let mut saver_thread = None;
+    // The save files go in their own folder inside disk_dir, so cleaning up
+    // afterwards can only ever delete what this program made.
+    let save_dir = disk_dir.map(|dir| dir.join("tick-sim-save"));
     if cfg.voxel_chunks > 0 {
         eprintln!("building voxel world of {} chunks...", cfg.voxel_chunks);
-        let sender = if cfg.save_every_ms > 0 {
-            let (sender, handle) = start_saver();
-            saver_thread = Some(handle);
-            Some(sender)
-        } else {
-            None
-        };
-        let terrain = VoxelWorld::new(&cfg, sender);
+        let mut terrain = VoxelWorld::new(&cfg);
         eprintln!("  {:.1}M voxels", terrain.voxel_count() as f64 / 1e6);
+
+        if cfg.save_every_ms > 0 || cfg.save_per_tick > 0 {
+            // With a disk, the saver starts with a compressed copy of every
+            // chunk, so it can build whole region files from the start.
+            let mirror: Vec<Vec<u8>> = match &save_dir {
+                Some(dir) => {
+                    std::fs::create_dir_all(dir).expect("couldn't make the save folder");
+                    eprintln!("  saving to {}", dir.display());
+                    terrain.chunks.iter().map(|chunk| compress(&chunk.blocks)).collect()
+                }
+                None => Vec::new(),
+            };
+            let backlog = Arc::new(AtomicUsize::new(0));
+            let (sender, handle) = start_saver(cfg, save_dir.clone(), mirror, Arc::clone(&backlog));
+            terrain.connect_saver(sender, backlog);
+            saver_thread = Some(handle);
+        }
         voxels = Some(terrain);
     }
 
@@ -1169,9 +1386,27 @@ fn main() {
     // join() waits for the thread to finish and hands back what it returned.
     let (samples, missed, pinned_ok, server_stats, voxel_stats) =
         tick_thread.join().expect("tick thread panicked");
-    let saver_stats = saver_thread.map(|handle| handle.join().expect("saver thread panicked"));
 
+    // Stop the players, load and hashing now, so they don't carry on while
+    // the saver catches up.
     stop.store(true, Ordering::Relaxed);
+
+    // The saver may still be working through chunk copies the tick queued.
+    // Time how long it takes to finish: that is how far behind it was.
+    let tick_done = Instant::now();
+    let saver_stats = saver_thread.map(|handle| {
+        let mut stats = handle.join().expect("saver thread panicked");
+        stats.catch_up = tick_done.elapsed();
+        stats
+    });
+    if let Some(dir) = &save_dir {
+        if cfg.keep_files {
+            eprintln!("save files left in {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     for handle in load_threads {
         handle.join().expect("load thread panicked");
     }
